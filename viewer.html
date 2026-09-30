@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OLED Sniffer</title>
+<style>
+  :root {
+    --bg: #111418; --panel: #1a1f25; --line: #2a313a; --text: #d8dee6;
+    --muted: #8a94a0; --accent: #4fb3ff; --bad: #ff6b6b; --good: #5fd38d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 980px; margin: 0 auto; display: grid; gap: 14px; }
+  h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button, select {
+    background: var(--panel); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); color: #06121d; border-color: var(--accent); font-weight: 600; }
+  button.rec { color: var(--bad); }
+  label { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); }
+  #status { margin-left: auto; color: var(--muted); }
+  #status.ok { color: var(--good); }
+  #status.err { color: var(--bad); }
+  .screen {
+    background: #000; border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px; display: flex; justify-content: center; overflow: hidden;
+  }
+  canvas { display: block; max-width: 100%; image-rendering: pixelated; }
+  .stats {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 8px;
+  }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  .stat b { display: block; font-size: 16px; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--muted); font-size: 12px; }
+  .stat.warn b { color: var(--bad); }
+  details { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
+  summary { cursor: pointer; color: var(--muted); }
+  #log {
+    margin: 8px 0 0; height: 220px; overflow: auto; font: 12px/1.45 ui-monospace, Consolas, monospace;
+    white-space: pre; color: var(--muted);
+  }
+  #unsupported { background: #3a1d1d; border: 1px solid var(--bad); border-radius: 8px; padding: 10px 12px; }
+  .hint { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="bar">
+    <h1>OLED Sniffer</h1>
+    <span id="status">Not connected</span>
+  </div>
+
+  <div id="unsupported" hidden>
+    This browser doesn't support Web Serial. Open this file in <b>Chrome</b> or <b>Edge</b> on a desktop computer.
+  </div>
+
+  <div class="bar">
+    <button id="connect" class="primary">Connect to Pod</button>
+    <button id="disconnect" disabled>Disconnect</button>
+    <button id="shot">Screenshot</button>
+    <button id="record" class="rec">● Record video</button>
+    <button id="clear">Clear screen</button>
+  </div>
+
+  <div class="bar">
+    <label>Address
+      <select id="addr">
+        <option value="60" selected>0x3C</option>
+        <option value="61">0x3D</option>
+      </select>
+    </label>
+    <label>Height
+      <select id="height">
+        <option value="64" selected>64</option>
+        <option value="32">32</option>
+      </select>
+    </label>
+    <label>Color
+      <select id="color">
+        <option value="white">White</option>
+        <option value="blue">Blue</option>
+        <option value="yb">Yellow / Blue</option>
+        <option value="green">Green</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="flipx"> Flip X</label>
+    <label><input type="checkbox" id="flipy"> Flip Y</label>
+    <label><input type="checkbox" id="grid" checked> Pixel grid</label>
+  </div>
+
+  <div class="screen"><canvas id="screen"></canvas></div>
+
+  <div class="stats">
+    <div class="stat"><b id="s-ups">0</b><span>screen updates/s</span></div>
+    <div class="stat"><b id="s-kbs">0.0</b><span>bus KB/s</span></div>
+    <div class="stat"><b id="s-txn">0</b><span>I2C transactions</span></div>
+    <div class="stat"><b id="s-addr">–</b><span>addresses seen</span></div>
+    <div class="stat" id="w-lost"><b id="s-lost">0</b><span>lost (Pod overflow / late IRQ)</span></div>
+    <div class="stat" id="w-usb"><b id="s-usb">0</b><span>USB drops</span></div>
+    <div class="stat" id="w-crc"><b id="s-crc">0</b><span>checksum errors</span></div>
+  </div>
+
+  <details id="logbox">
+    <summary>Command log (decoded SSD1306 commands)</summary>
+    <div id="log"></div>
+  </details>
+
+  <p class="hint">
+    If the image is mirrored, use Flip X / Flip Y. If you connected after the instrument booted,
+    the viewer has missed the setup commands. It assumes the usual defaults, and the picture
+    appears as soon as the instrument redraws the screen.
+  </p>
+</main>
+
+<script>
+// ============================ CORE BEGIN ===================================
+// Packet parser + SSD1306 emulator. No DOM access in this section.
+
+const PKT_I2C = 0x01, PKT_STATS = 0x02;
+const FLAG_FIRST = 0x01, FLAG_LAST = 0x02, FLAG_NACK = 0x04;
+
+class PacketParser {
+  constructor(onPacket) {
+    this.onPacket = onPacket;
+    this.buf = new Uint8Array(0);
+    this.checksumErrors = 0;
+  }
+  feed(bytes) {
+    const merged = new Uint8Array(this.buf.length + bytes.length);
+    merged.set(this.buf); merged.set(bytes, this.buf.length);
+    let i = 0;
+    const n = merged.length;
+    while (i + 6 <= n) {
+      if (merged[i] !== 0xA5 || merged[i + 1] !== 0x5A) { i++; continue; }
+      const type = merged[i + 2];
+      const len = merged[i + 3] | (merged[i + 4] << 8);
+      if (len > 4096) { i++; continue; }
+      if (i + 6 + len > n) break; // wait for the rest
+      let sum = (type + merged[i + 3] + merged[i + 4]) & 0xFF;
+      for (let k = 0; k < len; k++) sum = (sum + merged[i + 5 + k]) & 0xFF;
+      if (sum !== merged[i + 5 + len]) { this.checksumErrors++; i++; continue; }
+      this.onPacket(type, merged.subarray(i + 5, i + 5 + len));
+      i += 6 + len;
+    }
+    this.buf = merged.slice(i);
+  }
+}
+
+// Number of argument bytes that follow each multi-byte SSD1306 command.
+const CMD_ARGS = {
+  0x20: 1, 0x21: 2, 0x22: 2, 0x26: 6, 0x27: 6, 0x29: 5, 0x2A: 5, 0x81: 1, 0x8D: 1,
+  0xA3: 2, 0xA8: 1, 0xD3: 1, 0xD5: 1, 0xD9: 1, 0xDA: 1, 0xDB: 1,
+};
+
+const CMD_NAMES = {
+  0x20: 'addressing mode', 0x21: 'column range', 0x22: 'page range', 0x26: 'scroll right',
+  0x27: 'scroll left', 0x29: 'scroll v+right', 0x2A: 'scroll v+left', 0x2E: 'scroll off',
+  0x2F: 'scroll on', 0x81: 'contrast', 0x8D: 'charge pump', 0xA0: 'segment normal',
+  0xA1: 'segment remap', 0xA3: 'v-scroll area', 0xA4: 'show RAM', 0xA5: 'all pixels on',
+  0xA6: 'normal', 0xA7: 'inverted', 0xA8: 'multiplex', 0xAE: 'display OFF', 0xAF: 'display ON',
+  0xD3: 'display offset', 0xD5: 'clock div', 0xD9: 'precharge', 0xDA: 'COM pins', 0xDB: 'VCOMH',
+};
+
+class Ssd1306 {
+  constructor() { this.reset(); }
+  reset() {
+    this.ram = new Uint8Array(128 * 8);
+    // Defaults assume we joined late on a libDaisy-driven display:
+    // page addressing, segment remap + COM scan remapped (A1 / C8), display on.
+    this.addrMode = 2; this.col = 0; this.page = 0;
+    this.colStart = 0; this.colEnd = 127; this.pageStart = 0; this.pageEnd = 7;
+    this.segRemap = true; this.comRemap = true;
+    this.startLine = 0; this.offset = 0; this.mux = 64;
+    this.on = true; this.invert = false; this.allOn = false; this.contrast = 0x8F;
+    this.pendingOp = 0; this.pendingArgs = []; this.argsLeft = 0;
+    this.dirty = true; this.dataBytes = 0; this.pagesWritten = 0;
+    this.log = null; // optional (line) => void
+  }
+  command(b) {
+    if (this.argsLeft > 0) {
+      this.pendingArgs.push(b);
+      if (--this.argsLeft === 0) this.applyArgs(this.pendingOp, this.pendingArgs);
+      return;
+    }
+    if (CMD_ARGS[b] !== undefined) {
+      this.pendingOp = b; this.pendingArgs = []; this.argsLeft = CMD_ARGS[b];
+      return;
+    }
+    if (b <= 0x0F) { this.col = (this.col & 0xF0) | b; return; }
+    if (b <= 0x1F) { this.col = (this.col & 0x0F) | ((b & 0x0F) << 4); return; }
+    if (b >= 0x40 && b <= 0x7F) { this.startLine = b & 0x3F; this.dirty = true; return this.emit(b, `start line ${b & 0x3F}`); }
+    if (b >= 0xB0 && b <= 0xB7) { this.page = b & 7; this.pagesWritten++; return; }
+    if (b >= 0xC0 && b <= 0xCF) { this.comRemap = b >= 0xC8; this.dirty = true; return this.emit(b, b >= 0xC8 ? 'COM scan remap' : 'COM scan normal'); }
+    switch (b) {
+      case 0xA0: case 0xA1: this.segRemap = b === 0xA1; break;
+      case 0xA4: case 0xA5: this.allOn = b === 0xA5; break;
+      case 0xA6: case 0xA7: this.invert = b === 0xA7; break;
+      case 0xAE: case 0xAF: this.on = b === 0xAF; break;
+    }
+    this.dirty = true;
+    this.emit(b, CMD_NAMES[b] || 'unknown');
+  }
+  applyArgs(op, a) {
+    switch (op) {
+      case 0x20: this.addrMode = a[0] & 3; break;
+      case 0x21: this.colStart = a[0] & 0x7F; this.colEnd = a[1] & 0x7F; this.col = this.colStart; break;
+      case 0x22: this.pageStart = a[0] & 7; this.pageEnd = a[1] & 7; this.page = this.pageStart; break;
+      case 0x81: this.contrast = a[0]; break;
+      case 0xA8: this.mux = (a[0] & 0x3F) + 1; break;
+      case 0xD3: this.offset = a[0] & 0x3F; break;
+    }
+    this.dirty = true;
+    this.emit(op, `${CMD_NAMES[op] || 'unknown'} ${a.map(hex).join(' ')}`);
+  }
+  data(b) {
+    if (this.col < 128) this.ram[this.page * 128 + this.col] = b;
+    this.dataBytes++;
+    this.dirty = true;
+    if (this.addrMode === 0) { // horizontal
+      if (++this.col > this.colEnd) {
+        this.col = this.colStart;
+        if (++this.page > this.pageEnd) this.page = this.pageStart;
+      }
+    } else if (this.addrMode === 1) { // vertical
+      if (++this.page > this.pageEnd) {
+        this.page = this.pageStart;
+        if (++this.col > this.colEnd) this.col = this.colStart;
+      }
+    } else { // page
+      if (++this.col > 127) this.col = 0;
+    }
+  }
+  emit(b, text) { if (this.log) this.log(`${hex(b)}  ${text}`); }
+  // Pixel on the physical panel (x, y), as the viewer should draw it.
+  // Typical modules are mounted so that A1 + C8 gives an upright image.
+  pixel(x, y, rows) {
+    if (!this.on) return false;
+    if (this.allOn) return true;
+    const col = this.segRemap ? x : 127 - x;
+    const com = this.comRemap ? y : rows - 1 - y;
+    const row = (com + this.startLine + this.offset) & 63;
+    const bit = (this.ram[(row >> 3) * 128 + col] >> (row & 7)) & 1;
+    return (bit === 1) !== this.invert;
+  }
+}
+
+// Routes I2C chunks from the Pod into the emulator.
+class BusDecoder {
+  constructor(oled) {
+    this.oled = oled;
+    this.target = 0x3C;
+    this.txn = null;
+    this.transactions = 0;
+    this.nacks = 0;
+    this.addresses = new Set();
+    this.busBytes = 0;
+  }
+  chunk(flags, data) {
+    let i = 0;
+    if (flags & FLAG_FIRST) {
+      if (data.length === 0) { this.txn = null; return; }
+      const a = data[0];
+      this.addresses.add(a >> 1);
+      this.txn = { addr: a, expectCtrl: true, co: false, dc: false };
+      i = 1;
+    }
+    this.busBytes += data.length;
+    if (flags & FLAG_NACK) this.nacks++;
+    const t = this.txn;
+    if (t && (t.addr >> 1) === this.target && (t.addr & 1) === 0) {
+      for (; i < data.length; i++) {
+        const b = data[i];
+        if (t.expectCtrl) {
+          t.co = (b & 0x80) !== 0; t.dc = (b & 0x40) !== 0; t.expectCtrl = false;
+          continue;
+        }
+        if (t.dc) this.oled.data(b); else this.oled.command(b);
+        if (t.co) t.expectCtrl = true;
+      }
+    }
+    if (flags & FLAG_LAST) { this.txn = null; this.transactions++; }
+  }
+}
+
+function hex(b) { return b.toString(16).toUpperCase().padStart(2, '0'); }
+
+function parseStats(p) {
+  const dv = new DataView(p.buffer, p.byteOffset, p.byteLength);
+  return {
+    txns: dv.getUint32(0, true), bytes: dv.getUint32(4, true),
+    overflow: dv.getUint32(8, true), usbDrops: dv.getUint32(12, true), late: dv.getUint32(16, true),
+  };
+}
+// ============================= CORE END ====================================
+
+const $ = (id) => document.getElementById(id);
+const oled = new Ssd1306();
+const bus = new BusDecoder(oled);
+let podStats = null;
+
+const parser = new PacketParser((type, payload) => {
+  if (type === PKT_I2C && payload.length >= 1) bus.chunk(payload[0], payload.subarray(1));
+  else if (type === PKT_STATS && payload.length >= 20) podStats = parseStats(payload);
+});
+
+// ---------- rendering ----------
+const canvas = $('screen');
+const ctx = canvas.getContext('2d');
+let scale = 6;
+const PALETTES = {
+  white: ['#f4f7ff', '#f4f7ff'], blue: ['#5ec8ff', '#5ec8ff'],
+  yb: ['#ffd84a', '#5ec8ff'], green: ['#6dff9a', '#6dff9a'],
+};
+
+function rows() { return parseInt($('height').value, 10); }
+
+function fitCanvas() {
+  const avail = Math.min(canvas.parentElement.clientWidth - 28, 900);
+  scale = Math.max(2, Math.floor(avail / 128));
+  canvas.width = 128 * scale;
+  canvas.height = rows() * scale;
+  oled.dirty = true;
+}
+
+function render() {
+  const h = rows();
+  const [top, bottom] = PALETTES[$('color').value];
+  const fx = $('flipx').checked, fy = $('flipy').checked;
+  const gap = $('grid').checked && scale >= 4 ? 1 : 0;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  // Rough contrast preview: dim the pixels at low contrast settings.
+  ctx.globalAlpha = 0.45 + 0.55 * (oled.contrast / 255);
+  for (let y = 0; y < h; y++) {
+    ctx.fillStyle = y < 16 ? top : bottom; // two-color modules: top 16 rows differ
+    for (let x = 0; x < 128; x++) {
+      const px = fx ? 127 - x : x, py = fy ? h - 1 - y : y;
+      if (oled.pixel(px, py, h)) ctx.fillRect(x * scale, y * scale, scale - gap, scale - gap);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+let updatesThisSec = 0;
+function frame() {
+  // While recording, redraw every frame: the canvas stream only emits frames
+  // when the canvas changes, and a steady frame rate plays better on phones.
+  if (oled.dirty || recorder) { if (oled.dirty) updatesThisSec++; oled.dirty = false; render(); }
+  requestAnimationFrame(frame);
+}
+
+// ---------- stats ----------
+let lastBusBytes = 0;
+setInterval(() => {
+  $('s-ups').textContent = updatesThisSec; updatesThisSec = 0;
+  $('s-kbs').textContent = ((bus.busBytes - lastBusBytes) / 1024).toFixed(1);
+  lastBusBytes = bus.busBytes;
+  $('s-txn').textContent = (podStats ? podStats.txns : bus.transactions).toLocaleString();
+  $('s-addr').textContent = bus.addresses.size ? [...bus.addresses].map(a => '0x' + hex(a)).join(' ') : '–';
+  const lost = podStats ? podStats.overflow + podStats.late : 0;
+  $('s-lost').textContent = lost; $('w-lost').classList.toggle('warn', lost > 0);
+  $('s-usb').textContent = podStats ? podStats.usbDrops : 0;
+  $('s-crc').textContent = parser.checksumErrors; $('w-crc').classList.toggle('warn', parser.checksumErrors > 0);
+}, 1000);
+
+// ---------- command log ----------
+const logEl = $('log');
+const logLines = [];
+function logLine(s) {
+  logLines.push(s);
+  if (logLines.length > 400) logLines.splice(0, logLines.length - 400);
+  logDirty = true;
+}
+let logDirty = false;
+setInterval(() => {
+  if (!logDirty || !$('logbox').open) return;
+  logDirty = false;
+  const stick = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 4;
+  logEl.textContent = logLines.join('\n');
+  if (stick) logEl.scrollTop = logEl.scrollHeight;
+}, 250);
+oled.log = logLine;
+
+// ---------- serial ----------
+let port = null, reader = null, keepReading = false;
+
+function setStatus(text, cls) { const s = $('status'); s.textContent = text; s.className = cls || ''; }
+
+async function connect() {
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 }); // ignored by USB CDC, required by the API
+    // Asserting DTR makes some hosts start delivering CDC data right away.
+    try { await port.setSignals({ dataTerminalReady: true }); } catch (_) {}
+  } catch (e) {
+    if (e.name !== 'NotFoundError') setStatus('Could not open port: ' + e.message, 'err');
+    port = null;
+    return;
+  }
+  $('connect').disabled = true; $('disconnect').disabled = false;
+  setStatus('Connected', 'ok');
+  keepReading = true;
+  readLoop();
+}
+
+async function readLoop() {
+  while (port && keepReading && port.readable) {
+    reader = port.readable.getReader();
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) parser.feed(value);
+      }
+    } catch (e) {
+      if (keepReading) setStatus('Connection lost: ' + e.message, 'err');
+      break;
+    } finally {
+      reader.releaseLock();
+      reader = null;
+    }
+  }
+  await closePort();
+}
+
+async function closePort() {
+  keepReading = false;
+  if (reader) { try { await reader.cancel(); } catch (_) {} }
+  if (port) { try { await port.close(); } catch (_) {} }
+  port = null;
+  $('connect').disabled = false; $('disconnect').disabled = true;
+  if (!$('status').classList.contains('err')) setStatus('Not connected');
+}
+
+// ---------- capture ----------
+function download(blob, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+function stamp() { return new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19); }
+
+$('shot').onclick = () => canvas.toBlob(b => download(b, `oled-${stamp()}.png`));
+
+// MP4 (H.264) first so recordings play on iPhone / Photos; WebM as a fallback.
+const VIDEO_TYPES = [
+  'video/mp4;codecs=avc1.42E01E', 'video/mp4;codecs=avc1', 'video/mp4',
+  'video/webm;codecs=vp9', 'video/webm',
+];
+const videoType = VIDEO_TYPES.find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t));
+if (videoType) $('record').textContent = `● Record video (${videoType.startsWith('video/mp4') ? 'MP4' : 'WebM'})`;
+const recordLabel = $('record').textContent;
+
+let recorder = null;
+$('record').onclick = () => {
+  if (recorder) { recorder.stop(); return; }
+  if (!videoType) { setStatus('Video recording is not supported in this browser', 'err'); return; }
+  const chunks = [];
+  recorder = new MediaRecorder(canvas.captureStream(30), { mimeType: videoType, videoBitsPerSecond: 4e6 });
+  recorder.ondataavailable = e => e.data.size && chunks.push(e.data);
+  recorder.onstop = () => {
+    const ext = videoType.startsWith('video/mp4') ? 'mp4' : 'webm';
+    download(new Blob(chunks, { type: videoType.split(';')[0] }), `oled-${stamp()}.${ext}`);
+    recorder = null; $('record').textContent = recordLabel;
+  };
+  recorder.start(1000);
+  $('record').textContent = '■ Stop recording';
+};
+
+// ---------- wiring ----------
+$('connect').onclick = connect;
+$('disconnect').onclick = () => { setStatus('Not connected'); closePort(); };
+$('clear').onclick = () => { oled.ram.fill(0); oled.dirty = true; };
+$('addr').onchange = e => { bus.target = parseInt(e.target.value, 10); };
+$('height').onchange = fitCanvas;
+for (const id of ['color', 'flipx', 'flipy', 'grid']) $(id).onchange = () => { oled.dirty = true; };
+window.addEventListener('resize', fitCanvas);
+
+if (!('serial' in navigator)) {
+  $('unsupported').hidden = false;
+  $('connect').disabled = true;
+} else {
+  navigator.serial.addEventListener('disconnect', e => {
+    if (port && e.target === port) { setStatus('Pod unplugged', 'err'); closePort(); }
+  });
+}
+
+fitCanvas();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
